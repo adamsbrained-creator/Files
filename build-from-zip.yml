@@ -1,0 +1,149 @@
+name: Build APK from zip
+
+# For a repo that contains only a project zip, e.g. ix-app-files-round1.zip.
+#
+#   my-repo/
+#     .github/workflows/build-from-zip.yml   <- this file
+#     ix-app-files-round1.zip                <- the zip from Claude
+#
+# Push, and it unzips the project, builds an R8-minified, resource-shrunk release APK,
+# and uploads it. Push a newer zip (round2, round3...) and it builds that one.
+#
+# With no signing secrets the APK is signed with the debug key and installs right away.
+# To sign with your own key, add the four secrets from the project README
+# (IX_KEYSTORE_BASE64, IX_KEYSTORE_PASSWORD, IX_KEY_ALIAS, IX_KEY_PASSWORD).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.zip"
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Zip to build (path in the repo). Leave empty to use the newest zip in the repo root."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-zip-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_KEYSTORE: ${{ secrets.IX_KEYSTORE_BASE64 != '' }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Pick the zip
+        id: pick
+        env:
+          INPUT_ZIP: ${{ inputs.zip_path }}
+        run: |
+          if [ -n "$INPUT_ZIP" ]; then
+            ZIP="$INPUT_ZIP"
+          else
+            # Newest by version-aware name: round10 sorts after round9.
+            ZIP="$(ls -1 ./*.zip 2>/dev/null | sed 's|^\./||' | sort -V | tail -n 1)"
+          fi
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error::No zip found. Put the project zip in the repo root, or run the workflow with zip_path."
+            exit 1
+          fi
+          echo "Building from: $ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$ZIP" .zip)" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip the project
+        id: unzip
+        env:
+          ZIP: ${{ steps.pick.outputs.zip }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/src"
+          rm -rf "$RUNNER_TEMP/src/__MACOSX"
+          # The project root is the folder that holds settings.gradle(.kts).
+          SETTINGS="$(find "$RUNNER_TEMP/src" -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No settings.gradle(.kts) found inside the zip. Is it an Android project?"
+            exit 1
+          fi
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          if [ -f "$ROOT/gradlew" ]; then
+            chmod +x "$ROOT/gradlew"
+            echo "wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No gradlew in the zip. Falling back to Gradle 8.10.2."
+            echo "wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.unzip.outputs.wrapper == 'true' && 'wrapper' || '8.10.2' }}
+          build-root-directory: ${{ steps.unzip.outputs.root }}
+
+      - name: Decode signing keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          IX_KEYSTORE_BASE64: ${{ secrets.IX_KEYSTORE_BASE64 }}
+        run: |
+          echo "$IX_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          echo "IX_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build release APK (R8)
+        working-directory: ${{ steps.unzip.outputs.root }}
+        env:
+          IX_KEYSTORE_PASSWORD: ${{ secrets.IX_KEYSTORE_PASSWORD }}
+          IX_KEY_ALIAS: ${{ secrets.IX_KEY_ALIAS }}
+          IX_KEY_PASSWORD: ${{ secrets.IX_KEY_PASSWORD }}
+          WRAPPER: ${{ steps.unzip.outputs.wrapper }}
+        run: |
+          if [ "$WRAPPER" = "true" ]; then
+            ./gradlew --no-daemon --stacktrace :app:assembleRelease
+          else
+            gradle --no-daemon --stacktrace :app:assembleRelease
+          fi
+
+      - name: Collect outputs
+        env:
+          ROOT: ${{ steps.unzip.outputs.root }}
+          NAME: ${{ steps.pick.outputs.name }}
+        run: |
+          mkdir -p dist
+          APK="$(ls "$ROOT"/app/build/outputs/apk/release/*.apk | head -n 1)"
+          cp "$APK" "dist/${NAME}-release.apk"
+          cp "$ROOT/app/build/outputs/mapping/release/mapping.txt" "dist/${NAME}-mapping.txt" || true
+          if [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "::notice::No signing secrets found. This APK is signed with the debug key."
+          fi
+          ls -lh dist
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pick.outputs.name }}-release-apk
+          path: dist/*-release.apk
+          if-no-files-found: error
+
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pick.outputs.name }}-r8-mapping
+          path: dist/*-mapping.txt
+          if-no-files-found: warn
