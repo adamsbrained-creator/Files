@@ -1,0 +1,104 @@
+name: Build Files (signed, updates the installed app)
+
+# Builds the R8 release APK and signs it with the key in signing/ixfiles.jks, which is part of the repo.
+# The same key signs every build, so each new APK installs over the previous one as an update (no uninstall).
+# Same shape as the Eon workflow: runs on every push to main or by hand, and the plain .apk lands on the Releases page.
+#
+# If you use this one, delete .github/workflows/release-apk.yml (or set it to run by hand only),
+# otherwise every push builds twice.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-signed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works with loose project files in the repo root, or with a project .zip in the repo root.
+      - name: Find the project (unpack the zip if needed)
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            ROOT=.
+          else
+            ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "No settings.gradle.kts and no .zip in the repo root."; exit 1
+            fi
+            echo "Unpacking $ZIP"
+            mkdir -p _project
+            unzip -q -o "$ZIP" -d _project
+            FOUND=$(find _project -name settings.gradle.kts | head -1)
+            if [ -z "$FOUND" ]; then
+              echo "The zip has no settings.gradle.kts inside."; exit 1
+            fi
+            ROOT=$(dirname "$FOUND")
+          fi
+          ROOT=$(realpath "$ROOT")
+          echo "Project root: $ROOT"
+          if [ ! -f "$ROOT/signing/ixfiles.jks" ]; then
+            echo "Missing signing/ixfiles.jks in the project. Without it the APK would get a different key and could not update the installed app."; exit 1
+          fi
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # app/build.gradle.kts reads these four variables and signs the release build with them.
+      - name: Build release APK (R8, signed)
+        working-directory: ${{ env.ROOT }}
+        env:
+          IX_KEYSTORE_PATH: ${{ env.ROOT }}/signing/ixfiles.jks
+          IX_KEYSTORE_PASSWORD: ixfileskey
+          IX_KEY_ALIAS: ixfiles
+          IX_KEY_PASSWORD: ixfileskey
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Name the APK and show its signature
+        run: |
+          mkdir -p dist
+          cp "$ROOT"/app/build/outputs/apk/release/*.apk "dist/ix.app.files-${{ github.run_number }}.apk"
+          APKSIGNER=$(ls -1 "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          echo "Signing certificate (it must be the same on every build):"
+          "$APKSIGNER" verify --print-certs "dist/ix.app.files-${{ github.run_number }}.apk" | grep -i "SHA-256" || true
+          ls -lh dist
+
+      # Option 1: a zip you download from the run page (unzip, then install the .apk)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ix.app.files-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: r8-mapping
+          path: ${{ env.ROOT }}/app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+
+      # Option 2: the plain .apk on the Releases page, no unzipping needed
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Files build ${{ github.run_number }}
+          files: dist/*.apk
+          prerelease: true
